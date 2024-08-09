@@ -45,7 +45,7 @@ To run the tool, use the following command:
 
 ## Command-Line Flags
 
-- -i, --interface (default: en0): Network interface to listen on.
+- -i, --interface List of network interfaces to capture from (comma-separated). It listens on all by default.
 - -p, --protocol (default: all): Protocol to filter (values: all, tcp, udp).
 - -s, --save (default: ""): File to save captured packets in PCAP format.
 - -d, --dns (default: false): Display DNS queries and responses.
