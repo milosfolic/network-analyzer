@@ -3,27 +3,32 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
 )
 
 var (
-	protocol     string
-	saveToFile   string
-	displayDNS   bool
-	displayHTTP  bool
-	packetTable  table.Writer
-	packetRows   [][]interface{}
-	packetLimit  int
-	updatePeriod time.Duration
-	ifaces       []string
+	protocol         string
+	saveToFile       string
+	displayDNS       bool
+	displayHTTP      bool
+	packetLimit      int
+	updatePeriod     time.Duration
+	ifaces           []string
+	showSummaryStats bool
+	packetTable      *tview.Table
+	packetRows       [][]interface{}
+	totalPacketCount int
+	tcpCount         int
+	udpCount         int
+	icmpCount        int
+	arpCount         int
 )
 
 func main() {
@@ -37,13 +42,11 @@ func main() {
 			var err error
 
 			if len(ifaces) == 0 {
-				// If no interfaces are specified, get all available interfaces
 				interfaces, err = pcap.FindAllDevs()
 				if err != nil {
 					log.Fatal(err)
 				}
 			} else {
-				// Use the specified interfaces
 				interfaces, err = getSpecifiedInterfaces(ifaces)
 				if err != nil {
 					log.Fatal(err)
@@ -51,15 +54,15 @@ func main() {
 			}
 
 			for _, iface := range interfaces {
-				go analyze(iface.Name, protocol, saveToFile, displayDNS, displayHTTP)
+				go analyze(iface.Name, protocol, displayDNS, displayHTTP)
 			}
 
-			// Create a ticker to update the table at the specified interval
-			ticker := time.NewTicker(updatePeriod)
-			defer ticker.Stop()
+			go updateTablePeriodically()
 
-			for range ticker.C {
-				updateTable()
+			// Start the TUI application
+			app := tview.NewApplication()
+			if err := app.SetRoot(packetTable, true).Run(); err != nil {
+				log.Fatal(err)
 			}
 		},
 	}
@@ -69,8 +72,9 @@ func main() {
 	rootCmd.Flags().BoolVarP(&displayDNS, "dns", "d", false, "Display DNS queries and responses")
 	rootCmd.Flags().BoolVarP(&displayHTTP, "http", "t", false, "Display HTTP requests")
 	rootCmd.Flags().IntVarP(&packetLimit, "limit", "l", 20, "Limit the number of displayed rows in the table")
-	rootCmd.Flags().DurationVarP(&updatePeriod, "update-period", "u", 5*time.Second, "Time period for updating the table")
+	rootCmd.Flags().DurationVarP(&updatePeriod, "update-period", "u", 2*time.Second, "Time period for updating the table")
 	rootCmd.Flags().StringSliceVarP(&ifaces, "interfaces", "i", nil, "List of network interfaces to capture from (comma-separated). It listens on all by default")
+	rootCmd.Flags().BoolVarP(&showSummaryStats, "summary", "m", false, "Show summary statistics")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -78,13 +82,21 @@ func main() {
 }
 
 func setupTable() {
-	packetTable = table.NewWriter()
-	packetTable.SetOutputMirror(os.Stdout)
-	packetTable.AppendHeader(table.Row{
-		"Interface", "Protocol", "Src IP", "Dst IP", "Src Port", "Dst Port", "DNS Query", "DNS Response", "HTTP Method", "HTTP URL", "HTTP Host",
-	})
-	packetTable.SetStyle(table.StyleRounded)
-	packetTable.Style().Options.SeparateRows = true
+	packetTable = tview.NewTable()
+	packetTable.SetFixed(1, 0).SetSelectable(true, false).SetBorder(true).SetTitle("Network Analyzer").SetTitleAlign(tview.AlignCenter)
+
+	// Set header cells with a basic color code (e.g., 11 for yellow)
+	packetTable.SetCell(0, 0, tview.NewTableCell("Interface").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 1, tview.NewTableCell("Protocol").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 2, tview.NewTableCell("Src IP").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 3, tview.NewTableCell("Dst IP").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 4, tview.NewTableCell("Src Port").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 5, tview.NewTableCell("Dst Port").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 6, tview.NewTableCell("DNS Query").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 7, tview.NewTableCell("DNS Response").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 8, tview.NewTableCell("HTTP Method").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 9, tview.NewTableCell("HTTP URL").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 10, tview.NewTableCell("HTTP Host").SetAlign(tview.AlignCenter).SetTextColor(11))
 }
 
 func getSpecifiedInterfaces(ifaceNames []string) ([]pcap.Interface, error) {
@@ -109,7 +121,7 @@ func getSpecifiedInterfaces(ifaceNames []string) ([]pcap.Interface, error) {
 	return interfaces, nil
 }
 
-func analyze(iface, protocol, _ string, displayDNS, displayHTTP bool) {
+func analyze(iface, protocol string, displayDNS, displayHTTP bool) {
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
@@ -179,9 +191,28 @@ func analyzePacket(packet gopacket.Packet, iface string, displayDNS, displayHTTP
 		}
 	}
 
+	icmpLayer := packet.Layer(layers.LayerTypeICMPv4)
+	if icmpLayer != nil {
+		protocol = "ICMP"
+		icmpCount++
+	}
+
+	arpLayer := packet.Layer(layers.LayerTypeARP)
+	if arpLayer != nil {
+		protocol = "ARP"
+		arpCount++
+	}
+
 	packetRows = append(packetRows, []interface{}{
 		iface, protocol, srcIP, dstIP, srcPort, dstPort, dnsQuery, dnsResponse, httpMethod, httpURL, httpHost,
 	})
+
+	totalPacketCount++
+	if protocol == "TCP" {
+		tcpCount++
+	} else if protocol == "UDP" {
+		udpCount++
+	}
 }
 
 func checkForDNS(packet gopacket.Packet) (string, string) {
@@ -199,19 +230,14 @@ func checkForDNS(packet gopacket.Packet) (string, string) {
 	if dnsLayer == nil {
 		return "", ""
 	}
+
 	dns, _ := dnsLayer.(*layers.DNS)
-
 	var dnsQuery, dnsResponse string
-	for _, query := range dns.Questions {
-		dnsQuery = string(query.Name)
+	if dns.QDCount > 0 {
+		dnsQuery = string(dns.Questions[0].Name) // Convert []byte to string
 	}
-
-	if dns.QR {
-		for _, answer := range dns.Answers {
-			if answer.Type == layers.DNSTypeA {
-				dnsResponse = answer.IP.String()
-			}
-		}
+	if dns.ANCount > 0 {
+		dnsResponse = dns.Answers[0].IP.String()
 	}
 
 	return dnsQuery, dnsResponse
@@ -249,12 +275,46 @@ func checkForHTTP(packet gopacket.Packet) (string, string, string) {
 	return "", "", ""
 }
 
-func updateTable() {
-	packetTable.ResetRows()
+func updateTablePeriodically() {
+	ticker := time.NewTicker(updatePeriod)
+	defer ticker.Stop()
 
-	for _, row := range packetRows {
-		packetTable.AppendRow(row)
+	for range ticker.C {
+		updateTable()
+	}
+}
+
+func updateTable() {
+	packetTable.Clear()
+
+	// Set header cells with a basic color code (e.g., 11 for yellow)
+	packetTable.SetCell(0, 0, tview.NewTableCell("Interface").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 1, tview.NewTableCell("Protocol").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 2, tview.NewTableCell("Src IP").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 3, tview.NewTableCell("Dst IP").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 4, tview.NewTableCell("Src Port").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 5, tview.NewTableCell("Dst Port").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 6, tview.NewTableCell("DNS Query").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 7, tview.NewTableCell("DNS Response").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 8, tview.NewTableCell("HTTP Method").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 9, tview.NewTableCell("HTTP URL").SetAlign(tview.AlignCenter).SetTextColor(11))
+	packetTable.SetCell(0, 10, tview.NewTableCell("HTTP Host").SetAlign(tview.AlignCenter).SetTextColor(11))
+
+	// Populate table with packet data
+	for i, row := range packetRows {
+		for j, cell := range row {
+			packetTable.SetCell(i+1, j, tview.NewTableCell(fmt.Sprintf("%v", cell)).SetAlign(tview.AlignCenter))
+		}
 	}
 
-	packetTable.Render()
+	// Show summary statistics if enabled
+	if showSummaryStats {
+		packetTable.SetCell(len(packetRows)+1, 0, tview.NewTableCell(fmt.Sprintf("Total Packets: %d", totalPacketCount)).SetAlign(tview.AlignLeft))
+		packetTable.SetCell(len(packetRows)+2, 0, tview.NewTableCell(fmt.Sprintf("TCP Packets: %d", tcpCount)).SetAlign(tview.AlignLeft))
+		packetTable.SetCell(len(packetRows)+3, 0, tview.NewTableCell(fmt.Sprintf("UDP Packets: %d", udpCount)).SetAlign(tview.AlignLeft))
+		packetTable.SetCell(len(packetRows)+4, 0, tview.NewTableCell(fmt.Sprintf("ICMP Packets: %d", icmpCount)).SetAlign(tview.AlignLeft))
+		packetTable.SetCell(len(packetRows)+5, 0, tview.NewTableCell(fmt.Sprintf("ARP Packets: %d", arpCount)).SetAlign(tview.AlignLeft))
+	}
+
+	packetTable.ScrollToEnd()
 }
